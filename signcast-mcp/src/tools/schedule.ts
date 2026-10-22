@@ -74,7 +74,7 @@ async function resolveMedia(auth: AuthContext, name: string) {
   const db = getDb();
   const { data, error } = await db
     .from('media')
-    .select('id, name, type, store_id')
+    .select('id, name, media_type, store_id')
     .in('store_id', storeIds)
     .is('archived_at', null)
     .ilike('name', `%${name}%`)
@@ -263,7 +263,7 @@ export async function scheduleContent(
   if (conflicts.length > 0) {
     const { error } = await db
       .from('schedules')
-      .update({ archived_at: new Date().toISOString(), archived_by: auth.sub })
+      .update({ archived_at: new Date().toISOString() })
       .in(
         'id',
         conflicts.map((c) => c.schedule_id),
@@ -285,7 +285,7 @@ export async function scheduleContent(
       days_of_week: days,
       start_time: start,
       end_time: end,
-      created_via: 'mcp',
+      created_via: 'ai_assistant',
       created_by: auth.sub,
     })
     .select('id')

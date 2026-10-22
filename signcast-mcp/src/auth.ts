@@ -44,7 +44,30 @@ function rolesFromPayload(payload: JWTPayload): string[] {
   return [];
 }
 
+/**
+ * Auth0 signs with RS256. The most common bad token pasted here is the
+ * Supabase anon key (HS256, from the `apikey` header instead of the
+ * `Authorization` header) — catch it early with a message that says so.
+ */
+function assertRsaToken(token: string): void {
+  const seg = token.split('.')[0] ?? '';
+  let alg: unknown;
+  try {
+    alg = (JSON.parse(Buffer.from(seg, 'base64url').toString('utf8')) as { alg?: unknown }).alg;
+  } catch {
+    throw new Error('Token is not a parseable JWT.');
+  }
+  if (alg !== 'RS256') {
+    throw new Error(
+      `Unexpected token alg "${String(alg)}" — this endpoint needs your Auth0 login token (RS256). ` +
+        `If you pasted the Supabase anon key (HS256), copy the "Authorization" header value from the portal's network tab instead of the "apikey" header.`,
+    );
+  }
+}
+
 export async function verifyAuthToken(token: string): Promise<AuthContext> {
+  assertRsaToken(token); // fail fast with a clear message on the common anon-key mix-up
+
   const domain = process.env.AUTH0_DOMAIN;
   const apiAudience = process.env.AUTH0_AUDIENCE;
   const clientId = process.env.AUTH0_CLIENT_ID;

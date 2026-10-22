@@ -69,7 +69,7 @@ app.post('/mcp', async (req, res) => {
     await transport.handleRequest(req, res, req.body);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    const status = /Authorization|token|JWT|audience|issuer/i.test(message) ? 401 : 500;
+    const status = /Authorization|token|JWT|audience|issuer|alg/i.test(message) ? 401 : 500;
     if (!res.headersSent) res.status(status).json({ error: message });
   }
 });

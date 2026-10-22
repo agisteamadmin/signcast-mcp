@@ -6,9 +6,9 @@ import { getDb, callerStoreIds, callerStores } from '../db.js';
 import type { AuthContext } from '../auth.js';
 
 export const searchMediaSchema = {
-  query: z.string().describe('Name/text to search for (matches name and description).'),
+  query: z.string().describe('Name text to search for (matches media name).'),
   type: z
-    .enum(['image', 'video', 'text', 'audio'])
+    .enum(['image', 'video', 'text_slide'])
     .optional()
     .describe('Filter by media type. Omit for all types.'),
   limit: z.number().int().min(1).max(50).default(10).describe('Max results (1-50).'),
@@ -24,13 +24,13 @@ export async function searchMedia(
 
   let q = db
     .from('media')
-    .select('id, name, type, category, duration_seconds, store_id, created_at')
+    .select('id, name, media_type, category, duration_seconds, store_id, created_at')
     .in('store_id', storeIds)
     .is('archived_at', null)
-    .or(`name.ilike.%${args.query}%,description.ilike.%${args.query}%`)
+    .ilike('name', `%${args.query}%`)
     .order('created_at', { ascending: false })
     .limit(args.limit);
-  if (args.type) q = q.eq('type', args.type);
+  if (args.type) q = q.eq('media_type', args.type);
 
   const { data, error } = await q;
   if (error) throw new Error(`search_media failed: ${error.message}`);
@@ -38,7 +38,7 @@ export async function searchMedia(
   return {
     media: (data ?? []).map((m) => ({
       name: m.name,
-      type: m.type,
+      type: m.media_type,
       category: m.category,
       duration_seconds: m.duration_seconds,
       store: stores.get(m.store_id)?.name ?? '(unknown store)',
