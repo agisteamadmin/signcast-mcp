@@ -12,6 +12,7 @@ import { randomUUID } from 'node:crypto';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { verifyAuthToken, extractBearerToken, type AuthContext } from './auth.js';
+import { chat, type ChatMessage } from './chat.js';
 import { listDevices, listDevicesSchema } from './tools/devices.js';
 import { getSchedule, getScheduleSchema, scheduleContent, scheduleContentSchema } from './tools/schedule.js';
 import { searchMedia, searchMediaSchema } from './tools/media.js';
@@ -76,6 +77,30 @@ app.post('/mcp', async (req, res) => {
 
 app.get('/mcp', (_req, res) => {
   res.status(405).json({ error: 'Use POST /mcp with an MCP client (Streamable HTTP transport).' });
+});
+
+/**
+ * POST /chat — in-app AI Assistant.
+ * Body: { message: string, history?: [{ role: 'user'|'assistant', content: string }] }
+ * Same Bearer-token auth as /mcp. Runs the Anthropic tool loop server-side and
+ * returns { reply, tools_used }. The LLM API key never leaves the server.
+ */
+app.post('/chat', async (req, res) => {
+  try {
+    const token = extractBearerToken(req.headers.authorization);
+    const auth = await verifyAuthToken(token);
+    const { message, history } = (req.body ?? {}) as { message?: unknown; history?: ChatMessage[] };
+    if (!message || typeof message !== 'string') {
+      res.status(400).json({ error: 'Body must include "message" (string).' });
+      return;
+    }
+    const result = await chat(auth, message, Array.isArray(history) ? history : []);
+    res.json(result);
+  } catch (err) {
+    const messageText = err instanceof Error ? err.message : String(err);
+    const status = /Authorization|token|JWT|audience|issuer|alg/i.test(messageText) ? 401 : 500;
+    if (!res.headersSent) res.status(status).json({ error: messageText });
+  }
 });
 
 const port = Number(process.env.PORT ?? 3100);

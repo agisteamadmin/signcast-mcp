@@ -55,3 +55,13 @@ URL and sends the user's Auth0 token as `Authorization: Bearer <token>`. The ser
 verifies the JWT via the Auth0 JWKS, maps `sub` → stores via `store_members`, and
 every tool filters to those stores. Platform-admin-only tools (4c/4d) additionally
 require the `platform_admin` role claim.
+
+## POST /chat — in-app AI Assistant
+
+`POST /chat` with the same `Authorization: Bearer <token>` header and a JSON body
+`{ "message": "...", "history": [{ "role": "user"|"assistant", "content": "..." }] }`.
+The server verifies the token, then runs an Anthropic (Claude) tool-use loop against
+the same five tools — same powers, same store scoping — and returns
+`{ "reply": "...", "tools_used": [...] }`. The Anthropic API key stays on the server
+(`ANTHROPIC_API_KEY` env var); it never touches the browser. The loop is capped at
+8 tool steps per message to bound cost.
