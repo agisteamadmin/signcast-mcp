@@ -19,6 +19,27 @@ import { searchMedia, searchMediaSchema } from './tools/media.js';
 import { assignPlaylist, assignPlaylistSchema } from './tools/playlists.js';
 
 const app = express();
+
+/**
+ * CORS — the portal's AI Assistant page (Prompt 16) calls POST /chat from the
+ * browser on the Netlify origin, which is cross-origin to *.onrender.com. The
+ * `Authorization` header makes every request a preflighted one, so without
+ * these headers the browser blocks the call (Postman/Inspector are unaffected
+ * — they don't do CORS). Wildcard origin is safe here: auth rides on Bearer
+ * tokens, not cookies, so there is no CSRF exposure.
+ */
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type');
+  res.setHeader('Access-Control-Max-Age', '86400');
+  if (req.method === 'OPTIONS') {
+    res.status(204).end();
+    return;
+  }
+  next();
+});
+
 app.use(express.json());
 
 app.get('/health', (_req, res) => {

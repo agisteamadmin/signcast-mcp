@@ -134,7 +134,7 @@ export async function chat(
 ): Promise<{ reply: string; tools_used: string[] }> {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) throw new Error('ANTHROPIC_API_KEY is not set on the server.');
-  const model = process.env.ANTHROPIC_MODEL ?? 'claude-sonnet-4-5-20250929';
+  const model = process.env.ANTHROPIC_MODEL ?? 'claude-sonnet-5-5'; // verified Anthropic API ID (Oct 2026)
 
   const client = new Anthropic({ apiKey });
   const messages: Anthropic.MessageParam[] = [
