@@ -12,7 +12,8 @@ import type { AuthContext } from './auth.js';
 import { listDevices } from './tools/devices.js';
 import { getSchedule, scheduleContent } from './tools/schedule.js';
 import { searchMedia } from './tools/media.js';
-import { assignPlaylist } from './tools/playlists.js';
+import { assignPlaylist, addMediaToPlaylist, createPlaylist } from './tools/playlists.js';
+import { generateImage, publishGeneratedImage, editImage } from './tools/generation.js';
 
 const SYSTEM_PROMPT = `You are the SignCast AI assistant, helping a store owner manage their digital signage TVs.
 You can list their TV devices, check schedules, search their media library, schedule content on TVs, and assign playlists.
@@ -20,6 +21,8 @@ You can list their TV devices, check schedules, search their media library, sche
 Rules:
 - The tools are already scoped to the user's own stores. Never ask for IDs; use names (devices, media, playlists) and the tools resolve them.
 - schedule_content NEVER overwrites silently: if it returns conflicts with written:false, show the user what conflicts (content name, device, days, times) and ask "Replace it, or keep both?" If they say replace, call schedule_content again with replace_existing:true. If they say keep both, leave the existing schedule alone and confirm.
+- APPROVAL GATE for generated images: generate_image only makes a PREVIEW. Show the preview to the user as a markdown image (the preview_url) and ask for approval. NEVER call publish_generated_image, add_media_to_playlist, or schedule_content for a generated image until the user explicitly approves it ("yes", "approve", "looks good"). On approval, publish it (with the playlist they named, or the store default if they named none), then schedule it if they gave days/times.
+- The same gate applies to edit_image: an edit is a preview until approved. After an edit preview, ask the user to verify the changed text (e.g. the new price) reads correctly before publishing.
 - Times the user gives are in the store's local timezone.
 - Be concise and concrete: name the device, the content, the days/times. No jargon, no mention of tools, IDs, or JSON.
 - If a tool errors (ambiguous name, nothing found), relay the problem plainly and suggest the fix the error mentions.
@@ -93,6 +96,76 @@ const TOOLS: Anthropic.Tool[] = [
       required: ['device_name', 'playlist_name'],
     },
   },
+  {
+    name: 'generate_image',
+    description:
+      'Generate a branded TV image and return a preview URL. PREVIEW ONLY — nothing is saved, added to a playlist, or scheduled until publish_generated_image runs after the user approves. Use background_media_name to use a library image as the background; otherwise the background is AI-generated.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        prompt: { type: 'string', description: 'What the image should show/say.' },
+        store_name: { type: 'string', description: 'Store to generate for (fuzzy match).' },
+        background_media_name: { type: 'string', description: 'Library image to use as the background (fuzzy match).' },
+        headline: { type: 'string', description: 'Banner headline text rendered over the image.' },
+        use_logo: { type: 'boolean', description: 'Overlay the store logo (default true).' },
+        name: { type: 'string', description: 'Name for the generated image.' },
+      },
+      required: ['prompt'],
+    },
+  },
+  {
+    name: 'publish_generated_image',
+    description:
+      'Publish an APPROVED generation to the Media Library, optionally adding it to a playlist. Call ONLY after the user explicitly approves the preview.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        generation_id: { type: 'string', description: 'The generation_id from generate_image.' },
+        media_name: { type: 'string', description: 'Name for the saved library item.' },
+        playlist_name: { type: 'string', description: 'Playlist to add the image to (fuzzy match).' },
+      },
+      required: ['generation_id'],
+    },
+  },
+  {
+    name: 'edit_image',
+    description:
+      'Edit an existing library image by instruction (e.g. change a baked-in price from $11.99 to $10.99, keep everything else identical). PREVIEW ONLY — publish_generated_image after approval is what saves it.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        source_media_name: { type: 'string', description: 'Library image to edit (fuzzy match).' },
+        edit_instruction: { type: 'string', description: 'The change to make.' },
+        store_name: { type: 'string', description: 'Store the image belongs to (fuzzy match).' },
+        name: { type: 'string', description: 'Name for the edited image.' },
+      },
+      required: ['source_media_name', 'edit_instruction'],
+    },
+  },
+  {
+    name: 'add_media_to_playlist',
+    description: 'Add an existing media item to a playlist (appended at the end).',
+    input_schema: {
+      type: 'object',
+      properties: {
+        media_name: { type: 'string', description: 'Media item name (fuzzy match).' },
+        playlist_name: { type: 'string', description: 'Playlist name (fuzzy match).' },
+      },
+      required: ['media_name', 'playlist_name'],
+    },
+  },
+  {
+    name: 'create_playlist',
+    description: 'Create a new empty playlist (slideshow) in a store. Then add images with add_media_to_playlist.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        playlist_name: { type: 'string', description: 'Name for the new playlist.' },
+        store_name: { type: 'string', description: 'Store to create it in (fuzzy match).' },
+      },
+      required: ['playlist_name'],
+    },
+  },
 ];
 
 async function runTool(
@@ -112,6 +185,16 @@ async function runTool(
         return await scheduleContent(auth, input as never);
       case 'assign_playlist':
         return await assignPlaylist(auth, input as never);
+      case 'generate_image':
+        return await generateImage(auth, input as never);
+      case 'publish_generated_image':
+        return await publishGeneratedImage(auth, input as never);
+      case 'edit_image':
+        return await editImage(auth, input as never);
+      case 'add_media_to_playlist':
+        return await addMediaToPlaylist(auth, input as never);
+      case 'create_playlist':
+        return await createPlaylist(auth, input as never);
       default:
         return { error: `Unknown tool "${name}".` };
     }

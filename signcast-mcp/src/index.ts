@@ -27,6 +27,16 @@ import {
   unenrollDevice,
   unenrollDeviceSchema,
 } from './tools/admin.js';
+import {
+  generateImage,
+  generateImageSchema,
+  publishGeneratedImage,
+  publishGeneratedImageSchema,
+  editImage,
+  editImageSchema,
+} from './tools/generation.js';
+import { addMediaToPlaylist, addMediaToPlaylistSchema } from './tools/playlists.js';
+import { createPlaylist, createPlaylistSchema } from './tools/playlists.js';
 
 const app = express();
 
@@ -99,6 +109,27 @@ function buildServer(auth: AuthContext): McpServer {
 
   server.tool('unenroll_device', 'PLATFORM ADMIN ONLY: unenroll a device (clears store/playlist/schedule bindings, audits the action).', unenrollDeviceSchema, (args) =>
     unenrollDevice(auth, args).then((r) => ({ content: [{ type: 'text' as const, text: JSON.stringify(r, null, 2) }] })),
+  );
+
+  // Phase 7 — AI generation + approval publish + playlist add.
+  server.tool('generate_image', 'Generate a branded TV image (store logo + background image or AI background). Preview ONLY — nothing is saved, playlisted, or scheduled until publish_generated_image runs on the user\'s approval.', generateImageSchema, (args) =>
+    generateImage(auth, args).then((r) => ({ content: [{ type: 'text' as const, text: JSON.stringify(r, null, 2) }] })),
+  );
+
+  server.tool('publish_generated_image', 'Publish an approved generation to the Media Library, optionally adding it to a playlist. Call ONLY after the user approves the preview.', publishGeneratedImageSchema, (args) =>
+    publishGeneratedImage(auth, args).then((r) => ({ content: [{ type: 'text' as const, text: JSON.stringify(r, null, 2) }] })),
+  );
+
+  server.tool('edit_image', 'Edit an existing library image by instruction (e.g. change a baked-in price). Preview ONLY — publish_generated_image after approval is what saves it.', editImageSchema, (args) =>
+    editImage(auth, args).then((r) => ({ content: [{ type: 'text' as const, text: JSON.stringify(r, null, 2) }] })),
+  );
+
+  server.tool('add_media_to_playlist', 'Add an existing media item to a playlist (appended at the end).', addMediaToPlaylistSchema, (args) =>
+    addMediaToPlaylist(auth, args).then((r) => ({ content: [{ type: 'text' as const, text: JSON.stringify(r, null, 2) }] })),
+  );
+
+  server.tool('create_playlist', 'Create a new empty playlist (slideshow) in a store. Add images with add_media_to_playlist, then assign or schedule it.', createPlaylistSchema, (args) =>
+    createPlaylist(auth, args).then((r) => ({ content: [{ type: 'text' as const, text: JSON.stringify(r, null, 2) }] })),
   );
 
   return server;
