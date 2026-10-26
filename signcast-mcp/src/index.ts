@@ -17,6 +17,16 @@ import { listDevices, listDevicesSchema } from './tools/devices.js';
 import { getSchedule, getScheduleSchema, scheduleContent, scheduleContentSchema } from './tools/schedule.js';
 import { searchMedia, searchMediaSchema } from './tools/media.js';
 import { assignPlaylist, assignPlaylistSchema } from './tools/playlists.js';
+import {
+  listClients,
+  listClientsSchema,
+  listClientDevices,
+  listClientDevicesSchema,
+  enrollDevice,
+  enrollDeviceSchema,
+  unenrollDevice,
+  unenrollDeviceSchema,
+} from './tools/admin.js';
 
 const app = express();
 
@@ -72,6 +82,23 @@ function buildServer(auth: AuthContext): McpServer {
 
   server.tool('assign_playlist', 'Assign a playlist to a device (sets its primary playlist and targeting).', assignPlaylistSchema, (args) =>
     assignPlaylist(auth, args).then((r) => ({ content: [{ type: 'text' as const, text: JSON.stringify(r, null, 2) }] })),
+  );
+
+  // Phase 4c — platform-admin tools (role-gated inside each handler).
+  server.tool('list_clients', 'PLATFORM ADMIN ONLY: list all clients with store/device counts.', listClientsSchema, () =>
+    listClients(auth).then((r) => ({ content: [{ type: 'text' as const, text: JSON.stringify(r, null, 2) }] })),
+  );
+
+  server.tool('list_client_devices', 'PLATFORM ADMIN ONLY: list all devices of one client, with now-playing.', listClientDevicesSchema, (args) =>
+    listClientDevices(auth, args).then((r) => ({ content: [{ type: 'text' as const, text: JSON.stringify(r, null, 2) }] })),
+  );
+
+  server.tool('enroll_device', 'PLATFORM ADMIN ONLY: enroll a pending TV (by pairing code) into a store.', enrollDeviceSchema, (args) =>
+    enrollDevice(auth, args).then((r) => ({ content: [{ type: 'text' as const, text: JSON.stringify(r, null, 2) }] })),
+  );
+
+  server.tool('unenroll_device', 'PLATFORM ADMIN ONLY: unenroll a device (clears store/playlist/schedule bindings, audits the action).', unenrollDeviceSchema, (args) =>
+    unenrollDevice(auth, args).then((r) => ({ content: [{ type: 'text' as const, text: JSON.stringify(r, null, 2) }] })),
   );
 
   return server;
