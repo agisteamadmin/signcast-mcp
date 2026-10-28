@@ -671,3 +671,108 @@ export async function renderMenu(
       : `Menu "${row.name}" rendered (${pageNames.length} page${pageNames.length > 1 ? 's' : ''}) into playlist "${playlistName}". Assign it to a device to show it.`,
   };
 }
+
+// --------------------------------------------------------------- save_menu
+// One-call wholesale save for the portal editor: the editor already holds the
+// full edited menu, so diffing it into per-item update_menu calls is fragile
+// (and the editor's client-side ids don't exist on the server). The editor
+// sends the whole menu_data + style; the server replaces them. Name-based
+// lookup only — no ids cross the wire.
+export const saveMenuSchema = {
+  menu_name: z.string().describe('Dynamic menu name (fuzzy match, must resolve to one menu).'),
+  store_name: z.string().optional().describe('Store the menu belongs to (fuzzy match).'),
+  menu_data: z
+    .object({
+      title: z.string(),
+      price_note: z.string().nullable().optional(),
+      categories: z.array(
+        z.object({
+          name: z.string(),
+          price_note: z.string().nullable().optional(),
+          items: z.array(
+            z.object({
+              name: z.string(),
+              price: z.string().nullable().optional(),
+              note: z.string().optional(),
+              sold_out: z.boolean().optional(),
+            }),
+          ),
+        }),
+      ),
+      contact: z.object({ phone: z.string().optional(), address: z.string().optional() }).optional(),
+    })
+    .describe('Full edited menu data. Items with blank names are dropped.'),
+  style: z
+    .object({
+      background_color: z.string().optional(),
+      accent_color: z.string().optional(),
+      header_color: z.string().optional(),
+      text_color: z.string().optional(),
+      layout_notes: z.string().optional(),
+    })
+    .optional()
+    .describe('Style overrides, merged over the stored style.'),
+  background_media_name: z
+    .string()
+    .optional()
+    .describe('Library image name for the poster background (fuzzy match). Empty string clears it.'),
+};
+
+export async function saveMenu(
+  auth: AuthContext,
+  args: z.infer<z.ZodObject<typeof saveMenuSchema>>,
+) {
+  const db = getDb();
+  const { row, store } = await resolveMenu(auth, args.menu_name, args.store_name);
+  const existingStyle = (row.style as unknown as MenuStyle) ?? {};
+
+  const menu: MenuData = {
+    title: args.menu_data.title,
+    price_note: args.menu_data.price_note ?? null,
+    categories: args.menu_data.categories
+      .filter((c) => c.name.trim() !== '')
+      .map((c) => ({
+        name: c.name,
+        price_note: c.price_note ?? null,
+        items: c.items
+          .filter((it) => it.name.trim() !== '')
+          .map((it) => ({
+            name: it.name,
+            price: it.price ?? null,
+            note: it.note,
+            sold_out: it.sold_out ?? false,
+          })),
+      }))
+      .filter((c) => c.items.length > 0),
+    contact: args.menu_data.contact,
+  };
+  const style: MenuStyle = { ...existingStyle, ...(args.style ?? {}) };
+
+  const patch: Record<string, unknown> = { menu_data: menu, style };
+  if (args.background_media_name !== undefined) {
+    if (args.background_media_name === '') {
+      patch.background_media_id = null;
+    } else {
+      const q = args.background_media_name.toLowerCase();
+      const { data: media } = await db
+        .from('media')
+        .select('id, name, media_type')
+        .eq('store_id', store.id)
+        .is('archived_at', null);
+      const m = (media ?? []).filter((x) => x.name.toLowerCase().includes(q) && x.media_type === 'image');
+      if (m.length === 0) throw new Error(`No library image matches "${args.background_media_name}".`);
+      if (m.length > 1) throw new Error(`Ambiguous background — matches: ${m.map((x) => x.name).join(', ')}.`);
+      patch.background_media_id = m[0].id;
+    }
+  }
+
+  const { error } = await db.from('dynamic_menus').update(patch).eq('id', row.id);
+  if (error) throw new Error(`menu save failed: ${error.message}`);
+
+  return {
+    menu_name: row.name,
+    categories: menu.categories.length,
+    items: menu.categories.reduce((n, c) => n + c.items.length, 0),
+    message: `Menu "${row.name}" saved. Render it to update the poster and TV.`,
+  };
+}

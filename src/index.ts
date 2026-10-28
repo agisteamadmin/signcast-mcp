@@ -45,6 +45,8 @@ import {
   updateMenuSchema,
   renderMenu,
   renderMenuSchema,
+  saveMenu,
+  saveMenuSchema,
 } from './tools/dynamic_menu.js';
 
 const app = express();
@@ -156,6 +158,10 @@ function buildServer(auth: AuthContext): McpServer {
 
   server.tool('render_menu', 'Render a dynamic menu as poster pages, save them to the media library, replace the menu playlist contents, and optionally assign it to a device.', renderMenuSchema, (args) =>
     renderMenu(auth, args).then((r) => ({ content: [{ type: 'text' as const, text: JSON.stringify(r, null, 2) }] })),
+  );
+
+  server.tool('save_menu', 'Wholesale save for the portal editor: replace a dynamic menu\'s full menu_data and style in one call. Name-based lookup only — the editor\'s client-side ids are never sent.', saveMenuSchema, (args) =>
+    saveMenu(auth, args).then((r) => ({ content: [{ type: 'text' as const, text: JSON.stringify(r, null, 2) }] })),
   );
 
   return server;
