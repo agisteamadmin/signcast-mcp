@@ -193,3 +193,61 @@ export async function assignPlaylist(
     message: `"${device.name}" is now playing the "${playlist.name}" playlist.`,
   };
 }
+
+export const listPlaylistsSchema = {
+  store_name: z.string().optional().describe('Filter to one store by name (fuzzy match). Omit for all your stores.'),
+};
+
+export async function listPlaylists(
+  auth: AuthContext,
+  args: z.infer<z.ZodObject<typeof listPlaylistsSchema>>,
+) {
+  const db = getDb();
+  const storeIds = await callerStoreIds(auth.sub);
+  const { data: stores, error: stErr } = await db
+    .from('stores')
+    .select('id, name')
+    .in('id', storeIds);
+  if (stErr) throw new Error(`store lookup failed: ${stErr.message}`);
+  let ids = (stores ?? []).map((s) => s.id);
+  if (args.store_name) {
+    const q = args.store_name.toLowerCase();
+    const m = (stores ?? []).filter((s) => s.name.toLowerCase().includes(q));
+    if (m.length === 0) return { playlists: [], note: `No store matches "${args.store_name}".` };
+    ids = m.map((s) => s.id);
+  }
+  if (ids.length === 0) return { playlists: [] };
+  const storeName = new Map((stores ?? []).map((s) => [s.id, s.name]));
+
+  const { data: pls, error } = await db
+    .from('playlists')
+    .select('id, name, store_id, is_default, background_music_on')
+    .in('store_id', ids)
+    .is('archived_at', null)
+    .order('created_at', { ascending: false });
+  if (error) throw new Error(`list_playlists failed: ${error.message}`);
+  const playlistIds = (pls ?? []).map((p) => p.id);
+
+  const { data: items } = playlistIds.length
+    ? await db.from('playlist_items').select('playlist_id').in('playlist_id', playlistIds)
+    : { data: [] };
+  const itemCount = new Map<string, number>();
+  for (const it of items ?? []) itemCount.set(it.playlist_id, (itemCount.get(it.playlist_id) ?? 0) + 1);
+
+  const { data: links } = playlistIds.length
+    ? await db.from('playlist_devices').select('playlist_id, device_id').in('playlist_id', playlistIds)
+    : { data: [] };
+  const deviceCount = new Map<string, number>();
+  for (const l of links ?? []) deviceCount.set(l.playlist_id, (deviceCount.get(l.playlist_id) ?? 0) + 1);
+
+  return {
+    playlists: (pls ?? []).map((p) => ({
+      name: p.name,
+      store: storeName.get(p.store_id) ?? '(unknown store)',
+      is_default: p.is_default,
+      items: itemCount.get(p.id) ?? 0,
+      devices: deviceCount.get(p.id) ?? 0,
+      background_music_on: p.background_music_on,
+    })),
+  };
+}
