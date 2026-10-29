@@ -20,6 +20,7 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { z } from 'zod';
 import sharp from 'sharp';
+import { createHash } from 'node:crypto';
 import { getDb, callerStoreIds } from '../db.js';
 import type { AuthContext } from '../auth.js';
 import { assignPlaylist } from './playlists.js';
@@ -59,6 +60,44 @@ function escapeXml(s: string): string {
 }
 function sanitizeName(s: string): string {
   return s.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 80) || 'menu';
+}
+
+// Duplicate guards (owner requirement 2026-10-28): an item is a duplicate of
+// another when the names match after trim + lowercase, within the SAME
+// category of the SAME menu. The same name in a different category is fine.
+function normalizeItemName(s: string): string {
+  return s.trim().toLowerCase();
+}
+function findDuplicateItems(menu: MenuData): string[] {
+  const dupes: string[] = [];
+  for (const cat of menu.categories) {
+    const seen = new Set<string>();
+    for (const item of cat.items) {
+      const key = normalizeItemName(item.name);
+      if (!key) continue;
+      if (seen.has(key)) dupes.push(`"${item.name}" in "${cat.name}"`);
+      else seen.add(key);
+    }
+  }
+  return dupes;
+}
+function dedupeItems(menu: MenuData): number {
+  let removed = 0;
+  for (const cat of menu.categories) {
+    const seen = new Set<string>();
+    const kept: MenuItem[] = [];
+    for (const item of cat.items) {
+      const key = normalizeItemName(item.name);
+      if (key && seen.has(key)) {
+        removed++;
+        continue;
+      }
+      if (key) seen.add(key);
+      kept.push(item);
+    }
+    cat.items = kept;
+  }
+  return removed;
 }
 
 async function resolveStoreRow(auth: AuthContext, storeName?: string) {
@@ -123,6 +162,46 @@ function mediaTypeForPath(path: string): string {
   throw new Error(`Unsupported image type ".${ext}" — use a JPG, PNG, WebP, or GIF poster.`);
 }
 
+// Extract a JSON object from model text that may include a preamble,
+// markdown fences, or trailing commentary. Tries whole-text parse, then
+// first-'{' to last-'}', then a string-aware balanced-brace scan.
+function extractJsonObject(text: string): unknown {
+  let t = text.trim();
+  const fence = t.match(/```(?:json)?\s*([\s\S]*?)```/);
+  if (fence) t = fence[1].trim();
+  try {
+    return JSON.parse(t);
+  } catch { /* fall through */ }
+  const start = t.indexOf('{');
+  const end = t.lastIndexOf('}');
+  if (start >= 0 && end > start) {
+    try {
+      return JSON.parse(t.slice(start, end + 1));
+    } catch { /* fall through */ }
+  }
+  if (start >= 0) {
+    let depth = 0;
+    let inStr = false;
+    let esc = false;
+    for (let i = start; i < t.length; i++) {
+      const ch = t[i];
+      if (inStr) {
+        if (esc) esc = false;
+        else if (ch === '\\') esc = true;
+        else if (ch === '"') inStr = false;
+      } else if (ch === '"') {
+        inStr = true;
+      } else if (ch === '{') {
+        depth++;
+      } else if (ch === '}') {
+        depth--;
+        if (depth === 0) return JSON.parse(t.slice(start, i + 1));
+      }
+    }
+  }
+  throw new Error('no-json-object');
+}
+
 // -------------------------------------------------------------- extract_menu
 export const extractMenuSchema = {
   media_name: z.string().describe('Uploaded poster image in the media library (fuzzy match, must be an image).'),
@@ -180,7 +259,7 @@ export async function extractMenu(
   const client = new Anthropic({ apiKey });
   const resp = await client.messages.create({
     model,
-    max_tokens: 4096,
+    max_tokens: 16384,
     system: EXTRACT_SYSTEM,
     messages: [
       {
@@ -202,14 +281,14 @@ export async function extractMenu(
     .filter((b): b is Anthropic.TextBlock => b.type === 'text')
     .map((b) => b.text)
     .join('\n');
-  const jsonStart = text.indexOf('{');
-  const jsonEnd = text.lastIndexOf('}');
-  if (jsonStart < 0 || jsonEnd <= jsonStart) throw new Error('The AI did not return menu JSON — try again with a clearer poster photo.');
+  if (resp.stop_reason === 'max_tokens') {
+    throw new Error('The poster has too many items to extract in one pass (the AI output was cut off). Try a poster with fewer items, or split the menu into sections and extract each one.');
+  }
   let parsed: { title?: unknown; categories?: unknown; price_note?: unknown; contact?: unknown; style?: unknown };
   try {
-    parsed = JSON.parse(text.slice(jsonStart, jsonEnd + 1)) as typeof parsed;
+    parsed = extractJsonObject(text) as typeof parsed;
   } catch {
-    throw new Error('The AI returned malformed menu JSON — try again.');
+    throw new Error('The AI did not return menu JSON — try again with a clearer poster photo.');
   }
   if (!Array.isArray(parsed.categories)) throw new Error('The AI returned no categories — try a clearer poster photo.');
 
@@ -228,6 +307,7 @@ export async function extractMenu(
     })),
     contact: (parsed.contact as MenuData['contact']) ?? undefined,
   };
+  const dupesRemoved = dedupeItems(menuData);
   const style = (parsed.style as MenuStyle) ?? {};
 
   const menuName = args.menu_name ?? source.name;
@@ -263,7 +343,8 @@ export async function extractMenu(
     menu_data: menuData,
     style,
     message:
-      'Menu extracted as a DRAFT. Show the owner the categories, items, and prices and ask them to review and correct anything misread BEFORE rendering — a wrong price on a TV menu is costly. Corrections go through update_menu; rendering through render_menu.',
+      'Menu extracted as a DRAFT. Show the owner the categories, items, and prices and ask them to review and correct anything misread BEFORE rendering — a wrong price on a TV menu is costly. Corrections go through update_menu; rendering through render_menu.' +
+      (dupesRemoved > 0 ? ` ${dupesRemoved} duplicate item(s) from the poster were dropped.` : ''),
   };
 }
 
@@ -351,13 +432,18 @@ export async function updateMenu(
   }
   if (args.add_item) {
     const catName = args.add_item.category;
+    const addName = args.add_item.name;
+    const addPrice = args.add_item.price;
     let cat = menu.categories.find((c) => c.name.toLowerCase() === catName.toLowerCase());
     if (!cat) {
       cat = { name: catName, items: [] };
       menu.categories.push(cat);
       applied.push(`new category "${catName}"`);
     }
-    cat.items.push({ name: args.add_item.name, price: args.add_item.price ?? null, sold_out: false });
+    if (cat.items.some((i) => normalizeItemName(i.name) === normalizeItemName(addName))) {
+      throw new Error(`"${addName}" already exists in "${cat.name}" — not added.`);
+    }
+    cat.items.push({ name: addName, price: addPrice ?? null, sold_out: false });
     applied.push(`added "${args.add_item.name}" to ${cat.name}`);
   }
   if (applied.length === 0) throw new Error('No changes given — pass item_name with new_price/sold_out, add_item, new_title, or background_color.');
@@ -593,6 +679,7 @@ export async function renderMenu(
       }
     }
     const out = await pipeline.composite(composites).jpeg({ quality: 88 }).toBuffer();
+    const contentHash = createHash('sha256').update(out).digest('hex');
     const pageName = pages.length > 1 ? `Menu: ${row.name} (p${i + 1})` : `Menu: ${row.name}`;
     const mediaPath = `${store.id}/${ts}-${sanitizeName(pageName)}.jpg`;
     const { error: upErr } = await db.storage.from(MEDIA_BUCKET).upload(mediaPath, out, {
@@ -611,6 +698,7 @@ export async function renderMenu(
         storage_bucket: MEDIA_BUCKET,
         storage_path: mediaPath,
         duration_seconds: 15,
+        content_hash: contentHash,
         created_by: auth.sub,
       })
       .select('id, name')
@@ -746,6 +834,10 @@ export async function saveMenu(
       .filter((c) => c.items.length > 0),
     contact: args.menu_data.contact,
   };
+  const dupes = findDuplicateItems(menu);
+  if (dupes.length > 0) {
+    throw new Error(`Duplicate items not allowed: ${dupes.join(', ')}. Remove the duplicate before saving.`);
+  }
   const style: MenuStyle = { ...existingStyle, ...(args.style ?? {}) };
 
   const patch: Record<string, unknown> = { menu_data: menu, style };
