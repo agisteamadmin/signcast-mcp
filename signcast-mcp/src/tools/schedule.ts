@@ -6,6 +6,7 @@
  */
 import { z } from 'zod';
 import { getDb, callerStoreIds, callerStores } from '../db.js';
+import { resolveStore, findOrCreatePlaylist, resolveOrCreateYoutube } from './tv_control.js';
 import type { AuthContext } from '../auth.js';
 
 // ---------- shared helpers ----------
@@ -308,5 +309,150 @@ export async function scheduleContent(
       end_time: end,
     },
     message: `Scheduled "${media.name}" on ${devices.map((d) => d.name).join(', ')}.`,
+  };
+}
+
+// ---------- schedule_playlist (Chat TV Control, 2026-10-29) ----------
+// Same C2 conflict-first contract as schedule_content, but for playlists:
+// a slideshow's daily window (e.g. 5–9 PM), a menu playlist's hours, or a
+// YouTube item's off-hours window (youtube_url builds/finds its playlist).
+
+export const schedulePlaylistSchema = {
+  playlist_name: z.string().optional().describe('Playlist to schedule (fuzzy match). Omit when youtube_url is given.'),
+  youtube_url: z.string().optional().describe('YouTube link — a playlist is created/found for it (playlist_name, or "YouTube"). Needs migration 014.'),
+  store_name: z.string().optional().describe('Store (fuzzy match). Required for the YouTube path when the account has several stores.'),
+  devices: z
+    .array(z.string())
+    .min(1)
+    .describe('Device names (fuzzy match). Use list_devices to see names.'),
+  days: z
+    .array(z.string())
+    .min(1)
+    .describe('Days, e.g. ["Friday"], ["daily"], or ["weekdays"]. 0=Sunday..6=Saturday internally.'),
+  start_time: z.string().describe('Window start, HH:MM 24h, store-local time.'),
+  end_time: z.string().describe('Window end, HH:MM 24h, store-local time.'),
+  replace_existing: z
+    .boolean()
+    .default(false)
+    .describe(
+      'When true, conflicting schedules are archived and the new schedule is written. When false (default), conflicts are returned and nothing is written.',
+    ),
+};
+
+export async function schedulePlaylist(
+  auth: AuthContext,
+  args: z.infer<z.ZodObject<typeof schedulePlaylistSchema>>,
+) {
+  const start = parseTime(args.start_time);
+  const end = parseTime(args.end_time);
+  if (end <= start) throw new Error('end_time must be after start_time.');
+  const days = parseDays(args.days);
+  const db = getDb();
+
+  let playlist: { id: string; name: string; store_id: string };
+  if (args.youtube_url) {
+    const store = await resolveStore(auth, args.store_name);
+    const yt = await resolveOrCreateYoutube(db, store, args.youtube_url, auth.sub);
+    const pl = await findOrCreatePlaylist(db, store, args.playlist_name ?? 'YouTube');
+    playlist = { ...pl, store_id: store.id };
+    const { data: has } = await db
+      .from('playlist_items')
+      .select('id')
+      .eq('playlist_id', pl.id)
+      .eq('media_id', yt.id)
+      .limit(1);
+    if (!has || has.length === 0) {
+      const { data: items } = await db
+        .from('playlist_items')
+        .select('position')
+        .eq('playlist_id', pl.id)
+        .order('position', { ascending: false })
+        .limit(1);
+      const { error: addErr } = await db
+        .from('playlist_items')
+        .insert({ playlist_id: pl.id, media_id: yt.id, position: (items && items.length ? items[0].position : 0) + 1 });
+      if (addErr) throw new Error(`adding YouTube item failed: ${addErr.message}`);
+    }
+  } else {
+    if (!args.playlist_name) throw new Error('Name a playlist, or pass a YouTube link.');
+    const storeIds = await callerStoreIds(auth.sub);
+    const { data: pls, error: plErr } = await db
+      .from('playlists')
+      .select('id, name, store_id')
+      .in('store_id', storeIds)
+      .is('archived_at', null);
+    if (plErr) throw new Error(`playlist lookup failed: ${plErr.message}`);
+    const q = args.playlist_name.toLowerCase();
+    const m = (pls ?? []).filter((p) => p.name.toLowerCase().includes(q));
+    if (m.length === 0) throw new Error(`No playlist matches "${args.playlist_name}".`);
+    if (m.length > 1) throw new Error(`Ambiguous playlist — matches: ${m.map((p) => p.name).join(', ')}.`);
+    playlist = m[0];
+  }
+
+  const devices = await resolveDevices(auth, args.devices);
+  const wrong = devices.filter((d) => d.store_id !== playlist.store_id);
+  if (wrong.length > 0) {
+    throw new Error(`Device(s) ${wrong.map((d) => d.name).join(', ')} are in a different store than playlist "${playlist.name}".`);
+  }
+  const deviceIds = devices.map((d) => d.id);
+
+  const conflicts = await findConflicts(deviceIds, days, start, end);
+  if (conflicts.length > 0 && !args.replace_existing) {
+    return {
+      written: false,
+      conflicts,
+      message:
+        'Conflicting schedule(s) found. Reply "Replace it" to archive them and write the new schedule, or "keep both" to leave them playing alongside.',
+    };
+  }
+
+  if (conflicts.length > 0) {
+    const { error } = await db
+      .from('schedules')
+      .update({ archived_at: new Date().toISOString() })
+      .in(
+        'id',
+        conflicts.map((c) => c.schedule_id),
+      );
+    if (error) throw new Error(`archiving conflicts failed: ${error.message}`);
+  }
+
+  const stores = await callerStores(auth.sub);
+  const storeInfo = stores.get(playlist.store_id);
+  if (!storeInfo) throw new Error('Playlist store is not in your memberships.');
+
+  const { data: sched, error: insErr } = await db
+    .from('schedules')
+    .insert({
+      store_id: playlist.store_id,
+      client_id: storeInfo.client_id,
+      media_id: null,
+      playlist_id: playlist.id,
+      days_of_week: days,
+      start_time: start,
+      end_time: end,
+      created_via: 'ai_assistant',
+      created_by: auth.sub,
+    })
+    .select('id')
+    .single();
+  if (insErr) throw new Error(`schedule insert failed: ${insErr.message}`);
+
+  const { error: linkErr } = await db.from('schedule_devices').insert(
+    deviceIds.map((device_id) => ({ schedule_id: sched.id, device_id })),
+  );
+  if (linkErr) throw new Error(`schedule_devices insert failed: ${linkErr.message}`);
+
+  return {
+    written: true,
+    archived_conflicts: conflicts.map((c) => c.schedule_id),
+    schedule: {
+      playlist: playlist.name,
+      devices: devices.map((d) => d.name),
+      days: days.map((d) => DAY_NAMES[d]),
+      start_time: start,
+      end_time: end,
+    },
+    message: `Scheduled playlist "${playlist.name}" on ${devices.map((d) => d.name).join(', ')}.`,
   };
 }

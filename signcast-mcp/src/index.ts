@@ -14,7 +14,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { verifyAuthToken, extractBearerToken, type AuthContext } from './auth.js';
 import { chat, type ChatMessage } from './chat.js';
 import { listDevices, listDevicesSchema } from './tools/devices.js';
-import { getSchedule, getScheduleSchema, scheduleContent, scheduleContentSchema } from './tools/schedule.js';
+import { getSchedule, getScheduleSchema, scheduleContent, scheduleContentSchema, schedulePlaylist, schedulePlaylistSchema } from './tools/schedule.js';
 import { searchMedia, searchMediaSchema } from './tools/media.js';
 import { assignPlaylist, assignPlaylistSchema } from './tools/playlists.js';
 import {
@@ -48,6 +48,7 @@ import {
   saveMenu,
   saveMenuSchema,
 } from './tools/dynamic_menu.js';
+import { showOnTv, showOnTvSchema, nowPlaying, nowPlayingSchema } from './tools/tv_control.js';
 
 const app = express();
 
@@ -164,6 +165,19 @@ function buildServer(auth: AuthContext): McpServer {
     saveMenu(auth, args).then((r) => ({ content: [{ type: 'text' as const, text: JSON.stringify(r, null, 2) }] })),
   );
 
+  // Chat TV Control (2026-10-29) — show/schedule/now-playing for the chat window.
+  server.tool('show_on_tv', 'Show library images/video on a TV immediately: builds (or reuses) a playlist from the media and assigns it to the device. Returns needs_confirmation instead of writing when the device is already playing a different playlist.', showOnTvSchema, (args) =>
+    showOnTv(auth, args).then((r) => ({ content: [{ type: 'text' as const, text: JSON.stringify(r, null, 2) }] })),
+  );
+
+  server.tool('schedule_playlist', 'Schedule a playlist on TVs for a time window (slideshow hours, menu hours, YouTube off-hours). Same conflict rule as schedule_content: returns conflicts instead of overwriting.', schedulePlaylistSchema, (args) =>
+    schedulePlaylist(auth, args).then((r) => ({ content: [{ type: 'text' as const, text: JSON.stringify(r, null, 2) }] })),
+  );
+
+  server.tool('now_playing', 'What a device is assigned / actually playing right now, plus its schedule blocks.', nowPlayingSchema, (args) =>
+    nowPlaying(auth, args).then((r) => ({ content: [{ type: 'text' as const, text: JSON.stringify(r, null, 2) }] })),
+  );
+
   return server;
 }
 
@@ -192,7 +206,10 @@ app.get('/mcp', (_req, res) => {
 
 /**
  * POST /chat — in-app AI Assistant.
- * Body: { message: string, history?: [{ role: 'user'|'assistant', content: string }] }
+ * Body: { message: string, history?: [{ role: 'user'|'assistant', content: string }],
+ *         attachments?: string[] } — attachments are library media names the portal
+ *   already uploaded (duplicate-checked by content hash); they are prepended to
+ *   the message so the model can act on them with show_on_tv / extract_menu.
  * Same Bearer-token auth as /mcp. Runs the Anthropic tool loop server-side and
  * returns { reply, tools_used }. The LLM API key never leaves the server.
  */
@@ -200,12 +217,17 @@ app.post('/chat', async (req, res) => {
   try {
     const token = extractBearerToken(req.headers.authorization);
     const auth = await verifyAuthToken(token);
-    const { message, history } = (req.body ?? {}) as { message?: unknown; history?: ChatMessage[] };
+    const { message, history, attachments } = (req.body ?? {}) as {
+      message?: unknown;
+      history?: ChatMessage[];
+      attachments?: unknown;
+    };
     if (!message || typeof message !== 'string') {
       res.status(400).json({ error: 'Body must include "message" (string).' });
       return;
     }
-    const result = await chat(auth, message, Array.isArray(history) ? history : []);
+    const attachNames = Array.isArray(attachments) ? attachments.filter((a): a is string => typeof a === 'string') : [];
+    const result = await chat(auth, message, Array.isArray(history) ? history : [], attachNames);
     res.json(result);
   } catch (err) {
     const messageText = err instanceof Error ? err.message : String(err);

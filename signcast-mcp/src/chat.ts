@@ -10,11 +10,12 @@
 import Anthropic from '@anthropic-ai/sdk';
 import type { AuthContext } from './auth.js';
 import { listDevices } from './tools/devices.js';
-import { getSchedule, scheduleContent } from './tools/schedule.js';
+import { getSchedule, scheduleContent, schedulePlaylist } from './tools/schedule.js';
 import { searchMedia } from './tools/media.js';
 import { assignPlaylist, addMediaToPlaylist, createPlaylist, listPlaylists } from './tools/playlists.js';
 import { extractMenu, updateMenu, renderMenu } from './tools/dynamic_menu.js';
 import { generateImage, publishGeneratedImage, editImage } from './tools/generation.js';
+import { showOnTv, nowPlaying } from './tools/tv_control.js';
 
 const SYSTEM_PROMPT = `You are the SignCast AI assistant, helping a store owner manage their digital signage TVs.
 You can list their TV devices, check schedules, search their media library, schedule content on TVs, and assign playlists.
@@ -25,6 +26,14 @@ Rules:
 - APPROVAL GATE for generated images: generate_image only makes a PREVIEW. Show the preview to the user as a markdown image (the preview_url) and ask for approval. NEVER call publish_generated_image, add_media_to_playlist, or schedule_content for a generated image until the user explicitly approves it ("yes", "approve", "looks good"). On approval, publish it (with the playlist they named, or the store default if they named none), then schedule it if they gave days/times.
 - The same gate applies to edit_image: an edit is a preview until approved. After an edit preview, ask the user to verify the changed text (e.g. the new price) reads correctly before publishing.
 - DYNAMIC MENUS: extract_menu saves a DRAFT. Always present the extracted categories, items, and prices to the user and ask them to review and correct anything misread BEFORE rendering — a wrong price on a TV menu is costly. Corrections go through update_menu. render_menu replaces the menu playlist's contents with the new pages, so a TV already assigned that playlist shows the update automatically; if the user names a device, assign the playlist to it. When the user says "show it on my front desk TV" or names a TV, that device is the render target.
+- ATTACHED FILES: the user's message may start with "Attached library items: <names>." Those files are ALREADY in the media library — the portal uploaded them and blocked duplicates by content before sending. Use those exact names with show_on_tv, schedule_playlist, or extract_menu. Never ask the user to re-upload them.
+- SHOW ON TV: show_on_tv builds (or reuses) a playlist from the named/attached images or video and assigns it to the named device immediately. If it returns needs_confirmation, tell the user what is currently playing and ask "Replace it?" — only re-call with replace_existing:true when they say replace/yes. If they say keep it, leave the TV alone and confirm.
+- SLIDESHOW + HOURS: several images plus a time window (e.g. "from 5 to 9 PM daily") means: show_on_tv to build the playlist (or create_playlist + add_media_to_playlist), then schedule_playlist with days ["daily"] and 24h times (5 PM = 17:00, 9 PM = 21:00). schedule_playlist follows the same conflict rule as schedule_content: conflicts return written:false — show them and ask "Replace it, or keep both?"
+- VIDEO: videos work exactly like images through show_on_tv and schedule_playlist.
+- EDIT + SHOW: edit_image is a preview. Show the preview, ask the user to verify the changed text (e.g. the new price) reads correctly, and only after approval publish_generated_image, then show_on_tv.
+- DYNAMIC MENU FROM CHAT: an uploaded menu/price photo plus "make it dynamic" means extract_menu (draft), present it for review/correction, update_menu for fixes, render_menu to build the pages and the menu playlist, then show_on_tv (or render_menu's device_name) to put it on the TV. A later "mark X sold" or "change X price" means update_menu + render_menu again — the TV updates automatically because the playlist contents are replaced; no re-assign needed.
+- DUPLICATES: if an upload was blocked as already existing, say so plainly and use the existing library item — never create a second copy.
+- YOUTUBE OFF-HOURS: if the user wants a YouTube video during some hours and a menu/playlist during others, ask for the YouTube link and both time windows, then schedule_playlist for each (the YouTube one takes youtube_url). The TV plays the YouTube embed during its window and the playlist during the other window.
 - Times the user gives are in the store's local timezone.
 - Be concise and concrete: name the device, the content, the days/times. No jargon, no mention of tools, IDs, or JSON.
 - When listing things (devices, playlists, schedules), use short bullet lists, NOT markdown tables — tables render poorly in the narrow chat panel.
@@ -240,6 +249,52 @@ const TOOLS: Anthropic.Tool[] = [
       required: ['menu_name'],
     },
   },
+  {
+    name: 'show_on_tv',
+    description:
+      'Show library images/video on a TV immediately: builds (or reuses) a playlist from the media and assigns it to the device. Returns needs_confirmation instead of writing when the device is already playing a different playlist; re-call with replace_existing:true only after the user says replace.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        media_names: { type: 'array', items: { type: 'string' }, description: 'Library media names to show (fuzzy match each).' },
+        device_name: { type: 'string', description: 'Device to show on (fuzzy match).' },
+        store_name: { type: 'string', description: 'Store (fuzzy match).' },
+        playlist_name: { type: 'string', description: 'Playlist to fill (defaults to "Chat TV", reused per store).' },
+        youtube_url: { type: 'string', description: 'YouTube link to play (creates a youtube library item; needs migration 014).' },
+        replace_existing: { type: 'boolean', description: 'When true, switch the device even if it is playing another playlist.' },
+      },
+    },
+  },
+  {
+    name: 'schedule_playlist',
+    description:
+      'Schedule a playlist on TVs for a daily/time window (slideshow hours, menu hours, YouTube off-hours). Same conflict rule as schedule_content: returns conflicts instead of overwriting; writes only when re-called with replace_existing:true.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        playlist_name: { type: 'string', description: 'Playlist to schedule (fuzzy match). Omit when youtube_url is given.' },
+        youtube_url: { type: 'string', description: 'YouTube link — a playlist is created/found for it (playlist_name, or "YouTube"). Needs migration 014.' },
+        store_name: { type: 'string', description: 'Store (fuzzy match). Required for the YouTube path when the account has several stores.' },
+        devices: { type: 'array', items: { type: 'string' }, description: 'Device names.' },
+        days: { type: 'array', items: { type: 'string' }, description: 'Days, e.g. ["Friday"] or ["daily"].' },
+        start_time: { type: 'string', description: 'Window start, HH:MM 24h, store-local time.' },
+        end_time: { type: 'string', description: 'Window end, HH:MM 24h, store-local time.' },
+        replace_existing: { type: 'boolean', description: 'When true, conflicting schedules are archived and the new schedule is written.' },
+      },
+      required: ['devices', 'days', 'start_time', 'end_time'],
+    },
+  },
+  {
+    name: 'now_playing',
+    description: 'What a device is assigned / actually playing right now, plus its schedule blocks. Use it before asking a replace-or-keep question.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        device_name: { type: 'string', description: 'Device (fuzzy match).' },
+        store_name: { type: 'string', description: 'Store (fuzzy match).' },
+      },
+    },
+  },
 ];
 
 async function runTool(
@@ -277,6 +332,12 @@ async function runTool(
         return await updateMenu(auth, input as never);
       case 'render_menu':
         return await renderMenu(auth, input as never);
+      case 'show_on_tv':
+        return await showOnTv(auth, input as never);
+      case 'schedule_playlist':
+        return await schedulePlaylist(auth, input as never);
+      case 'now_playing':
+        return await nowPlaying(auth, input as never);
       default:
         return { error: `Unknown tool "${name}".` };
     }
@@ -296,17 +357,22 @@ export async function chat(
   auth: AuthContext,
   message: string,
   history: ChatMessage[] = [],
+  attachments: string[] = [],
 ): Promise<{ reply: string; tools_used: string[] }> {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) throw new Error('ANTHROPIC_API_KEY is not set on the server.');
   const model = process.env.ANTHROPIC_MODEL ?? 'claude-sonnet-5-5'; // verified Anthropic API ID (Oct 2026)
 
   const client = new Anthropic({ apiKey });
+  const fullMessage =
+    attachments.length > 0
+      ? `Attached library items: ${attachments.join(', ')}.\n${message}`
+      : message;
   const messages: Anthropic.MessageParam[] = [
     ...history
       .filter((m) => m.role === 'user' || m.role === 'assistant')
       .map((m) => ({ role: m.role, content: m.content })),
-    { role: 'user', content: message },
+    { role: 'user', content: fullMessage },
   ];
   const toolsUsed: string[] = [];
 
