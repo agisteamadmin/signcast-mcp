@@ -244,12 +244,15 @@ export async function generateImage(
 
 // ------------------------------------------------------------- edit_image
 // Instruction-based edit of an existing library image (e.g. change a baked-in
-// price from $11.99 to $10.99). Uses Pollinations' kontext model with the
-// source image as reference. Like generate_image, this returns a PREVIEW only;
-// publish_generated_image (after approval) is what saves it to the library.
-// Caveat: the model regenerates the image, so fine details can shift slightly
-// — the preview + approval step exists so the client verifies the new text
-// before anything goes live.
+// price from $11.99 to $10.99). Uses Pollinations' flux image-to-image with
+// the source image as reference. NOTE (2026-11-03): the kontext model was
+// removed from Pollinations' free Classic API (it 403s with "kontext isn't
+// part of the Classic API — use a pollen key"), so edits use flux, which
+// accepts the same ?image= reference on the free tier. Flux img2img is less
+// faithful to the original than kontext was, so the preview + approval step
+// matters even more — the client must verify the new text before publish.
+// Like generate_image, this returns a PREVIEW only; publish_generated_image
+// (after approval) is what saves it to the library.
 export const editImageSchema = {
   source_media_name: z.string().describe('Library image to edit (fuzzy match, must be an image in your stores).'),
   edit_instruction: z.string().describe('The change, e.g. "change the price text from $11.99 to $10.99, keep everything else identical".'),
@@ -327,7 +330,7 @@ export async function editImage(
   const editPrompt = `${args.edit_instruction}. Keep everything else in the image exactly identical.`;
   const url =
     `https://image.pollinations.ai/prompt/${encodeURIComponent(editPrompt)}` +
-    `?image=${encodeURIComponent(signed.signedUrl)}&model=kontext&width=${TV_W}&height=${TV_H}&nologo=true`;
+    `?image=${encodeURIComponent(signed.signedUrl)}&model=flux&width=${TV_W}&height=${TV_H}&nologo=true`;
   let edited: Buffer;
   try {
     edited = await fetchUrlBuffer(url);
@@ -347,7 +350,7 @@ export async function editImage(
     .upsert(
       {
         store_id: store.id,
-        provider: 'kontext',
+        provider: 'flux',
         media_kind: 'image',
         prompt: editPrompt,
         prompt_hash: promptHash,
