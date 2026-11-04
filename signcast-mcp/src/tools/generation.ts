@@ -73,8 +73,8 @@ async function downloadFromBucket(bucket: string, path: string): Promise<Buffer>
   return Buffer.from(await data.arrayBuffer());
 }
 
-async function fetchUrlBuffer(url: string): Promise<Buffer> {
-  const res = await fetch(url, { signal: AbortSignal.timeout(60000) });
+async function fetchUrlBuffer(url: string, headers?: Record<string, string>): Promise<Buffer> {
+  const res = await fetch(url, { signal: AbortSignal.timeout(60000), headers });
   if (!res.ok) throw new Error(`Fetch failed (${res.status}) for ${url}`);
   return Buffer.from(await res.arrayBuffer());
 }
@@ -244,13 +244,14 @@ export async function generateImage(
 
 // ------------------------------------------------------------- edit_image
 // Instruction-based edit of an existing library image (e.g. change a baked-in
-// price from $11.99 to $10.99). Uses Pollinations' flux image-to-image with
-// the source image as reference. NOTE (2026-11-03): the kontext model was
-// removed from Pollinations' free Classic API (it 403s with "kontext isn't
-// part of the Classic API — use a pollen key"), so edits use flux, which
-// accepts the same ?image= reference on the free tier. Flux img2img is less
-// faithful to the original than kontext was, so the preview + approval step
-// matters even more — the client must verify the new text before publish.
+// price from $40 to $19.99). Uses Pollinations' kontext model with the
+// source image as reference. REQUIRES a Pollinations pollen key:
+// kontext was removed from the free Classic API (403), and the free flux
+// model IGNORES the reference image (proven 2026-11-03: a mountain photo
+// "edited" with flux came back as an unrelated portrait) — so without a key
+// this tool FAILS FAST with a clear message instead of showing a fake
+// "edit" preview. Setup: create a key at https://enter.pollinations.ai and
+// set POLLINATIONS_API_KEY in the Render environment, then redeploy.
 // Like generate_image, this returns a PREVIEW only; publish_generated_image
 // (after approval) is what saves it to the library.
 export const editImageSchema = {
@@ -328,12 +329,20 @@ export async function editImage(
   }
 
   const editPrompt = `${args.edit_instruction}. Keep everything else in the image exactly identical.`;
+  // Free-tier flux IGNORES the reference image (it generates from text only),
+  // so an edit without a pollen key would show a fake preview. Fail fast.
+  const pollenKey = process.env.POLLINATIONS_API_KEY;
+  if (!pollenKey) {
+    throw new Error(
+      'Image editing needs a Pollinations pollen key: create one at https://enter.pollinations.ai, set POLLINATIONS_API_KEY in the Render environment, and redeploy. Without it the free tier cannot edit an existing image — it would generate an unrelated picture instead of editing yours.',
+    );
+  }
   const url =
     `https://image.pollinations.ai/prompt/${encodeURIComponent(editPrompt)}` +
-    `?image=${encodeURIComponent(signed.signedUrl)}&model=flux&width=${TV_W}&height=${TV_H}&nologo=true`;
+    `?image=${encodeURIComponent(signed.signedUrl)}&model=kontext&width=${TV_W}&height=${TV_H}&nologo=true`;
   let edited: Buffer;
   try {
-    edited = await fetchUrlBuffer(url);
+    edited = await fetchUrlBuffer(url, { Authorization: `Bearer ${pollenKey}` });
   } catch (err) {
     throw new Error(`Image edit failed: ${err instanceof Error ? err.message : String(err)}`);
   }
@@ -350,7 +359,7 @@ export async function editImage(
     .upsert(
       {
         store_id: store.id,
-        provider: 'flux',
+        provider: 'kontext',
         media_kind: 'image',
         prompt: editPrompt,
         prompt_hash: promptHash,
