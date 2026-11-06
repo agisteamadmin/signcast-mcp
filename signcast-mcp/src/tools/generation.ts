@@ -252,6 +252,10 @@ export async function generateImage(
 // this tool FAILS FAST with a clear message instead of showing a fake
 // "edit" preview. Setup: create a key at https://enter.pollinations.ai and
 // set POLLINATIONS_API_KEY in the Render environment, then redeploy.
+// Calls the gen.pollinations.ai production endpoint (GET /image/{prompt}) —
+// the legacy image.pollinations.ai "Classic API" endpoint does not honor the
+// new pollen keys (the key sat at "Used: never" for 3 days while every edit
+// 403d, 2026-11-06). Auth is the Bearer header; docs also allow ?key=.
 // Like generate_image, this returns a PREVIEW only; publish_generated_image
 // (after approval) is what saves it to the library.
 export const editImageSchema = {
@@ -338,7 +342,7 @@ export async function editImage(
     );
   }
   const url =
-    `https://image.pollinations.ai/prompt/${encodeURIComponent(editPrompt)}` +
+    `https://gen.pollinations.ai/image/${encodeURIComponent(editPrompt)}` +
     `?image=${encodeURIComponent(signed.signedUrl)}&model=kontext&width=${TV_W}&height=${TV_H}&nologo=true`;
   let edited: Buffer;
   try {
